@@ -1,0 +1,967 @@
+import hashlib
+import json
+import math
+import os
+import time
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from datetime import datetime
+
+INPUT_FILE = 'mqtt.jsonl'
+INPUT_MODE = 'jsonl'  # auto | json_array | jsonl
+CHUNK_SIZE_MB = 8
+IO_BUFFER_MB = 8
+
+WINDOW_SPECS = (1, 5, 30)
+MIN_PKT_CNT = 20
+INTER_SAMPLE_MAXLEN = 4096
+EPS = 1e-9
+REQ_RESP_RATIO_CAP = 1_000_000.0
+
+OUTPUT_PREFIX = 'mqtt'
+OUTPUT_SUFFIXES = ('key', 'sparse', 'global')
+
+SCHEMA_VERSION = 'mqtt_v1'
+SNAPSHOT_FILE = 'mqtt.preprocess.progress.json'
+ENABLE_RESUME = True
+RESUME_STRICT_SIGNATURE = True
+FLUSH_EVERY = 200000
+SNAPSHOT_EVERY = 1000000
+PRINT_EVERY = 500000
+ERROR_SAMPLE_LIMIT = 5
+AGG_CLEANUP_EVERY = 100000
+
+
+def _first(val):
+    if isinstance(val, list):
+        return val[0] if val else None
+    return val
+
+
+def as_dict(val):
+    val = _first(val)
+    return val if isinstance(val, dict) else {}
+
+
+def to_int(val, default=0):
+    val = _first(val)
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return default
+
+
+def to_float(val, default=0.0):
+    val = _first(val)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_epoch_seconds(val, default=0.0):
+    val = _first(val)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return default
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        try:
+            return datetime.fromisoformat(s).timestamp()
+        except ValueError:
+            return default
+    return default
+
+
+def detect_input_mode(path):
+    probe_size = 64 * 1024
+    with open(path, 'rb') as f:
+        head = f.read(probe_size)
+    if not head:
+        return 'json_array'
+    if head.startswith(b'\xef\xbb\xbf'):
+        head = head[3:]
+    if b'\x00' in head:
+        head = head.replace(b'\x00', b'')
+    for b in head:
+        if chr(b).isspace():
+            continue
+        return 'json_array' if b == ord('[') else 'jsonl'
+    return 'json_array'
+
+
+def file_signature(path):
+    st = os.stat(path)
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        h.update(f.read(1024 * 1024))
+    return {
+        'size': st.st_size,
+        'mtime_ns': st.st_mtime_ns,
+        'inode': getattr(st, 'st_ino', None),
+        'head_sha1_1mb': h.hexdigest(),
+    }
+
+
+def signatures_match(snapshot_sig, current_sig):
+    if not isinstance(snapshot_sig, dict):
+        return False
+    for key in ('size', 'mtime_ns', 'head_sha1_1mb'):
+        if snapshot_sig.get(key) != current_sig.get(key):
+            return False
+    return True
+
+
+def iter_json_array(path, chunk_size_mb):
+    decoder = json.JSONDecoder()
+    chunk_size = chunk_size_mb * 1024 * 1024
+    buffer = ''
+    eof = False
+    in_array = False
+    need_more = True
+
+    with open(path, 'rb', buffering=chunk_size) as f:
+        while True:
+            if not eof and (need_more or len(buffer) < chunk_size):
+                chunk = f.read(chunk_size)
+                if chunk:
+                    if b'\x00' in chunk:
+                        chunk = chunk.replace(b'\x00', b'')
+                    buffer += chunk.decode('utf-8', errors='ignore')
+                    need_more = False
+                else:
+                    eof = True
+
+            if not in_array:
+                idx = buffer.find('[')
+                if idx == -1:
+                    if eof:
+                        return
+                    buffer = ''
+                    continue
+                buffer = buffer[idx + 1:]
+                in_array = True
+
+            i = 0
+            blen = len(buffer)
+            while i < blen and buffer[i] in ' \r\n\t,':
+                i += 1
+            if i > 0:
+                buffer = buffer[i:]
+
+            if not buffer:
+                if eof:
+                    return
+                need_more = True
+                continue
+
+            if buffer[0] == ']':
+                return
+
+            try:
+                obj, idx = decoder.raw_decode(buffer)
+                yield obj, None, None, None
+                buffer = buffer[idx:]
+                need_more = False
+            except json.JSONDecodeError as exc:
+                if eof:
+                    remaining = buffer.strip(' \r\n\t,')
+                    if remaining and remaining != ']':
+                        yield None, f'EOF decode error: {exc.msg}', None, None
+                    return
+                need_more = True
+                if len(buffer) > 50_000_000:
+                    next_obj = buffer.find('{', 1)
+                    if next_obj == -1:
+                        dropped = len(buffer)
+                        buffer = ''
+                        yield None, f'array resync: dropped {dropped} chars', None, None
+                    else:
+                        dropped = next_obj
+                        buffer = buffer[next_obj:]
+                        yield None, f'array resync: skipped {dropped} chars', None, None
+
+
+def iter_json_lines(path, io_buffer_mb, start_offset=0, drop_partial_line=False):
+    io_buffer = io_buffer_mb * 1024 * 1024
+    with open(path, 'rb', buffering=io_buffer) as f:
+        if start_offset > 0:
+            f.seek(start_offset)
+            if drop_partial_line:
+                f.readline()
+
+        line_no = 0
+        while True:
+            raw = f.readline()
+            if not raw:
+                break
+            line_no += 1
+            off_after = f.tell()
+            if b'\x00' in raw:
+                raw = raw.replace(b'\x00', b'')
+            line = raw.decode('utf-8', errors='ignore').strip()
+            line = line.lstrip('\ufeff')
+            if not line or line in ('[', ']', ','):
+                continue
+            if line.endswith(','):
+                line = line[:-1].rstrip()
+            if not line or line in ('[', ']'):
+                continue
+            try:
+                yield json.loads(line), None, off_after, line_no
+            except json.JSONDecodeError as exc:
+                yield None, f'line {line_no}: {exc.msg} | preview={line[:120]}', off_after, line_no
+
+
+def iter_records(path, input_mode, chunk_size_mb, io_buffer_mb, start_offset=0, drop_partial_line=False):
+    mode = input_mode
+    if mode == 'auto':
+        mode = detect_input_mode(path)
+    if mode == 'json_array':
+        if start_offset > 0:
+            raise RuntimeError('json_array mode does not support byte offset resume')
+        return mode, iter_json_array(path, chunk_size_mb)
+    if mode == 'jsonl':
+        return mode, iter_json_lines(path, io_buffer_mb, start_offset, drop_partial_line)
+    raise ValueError(f'unsupported INPUT_MODE: {mode}')
+
+
+def parse_mqtt_packet(pkt):
+    layers = as_dict(as_dict(pkt.get('_source')).get('layers'))
+    if 'mqtt' not in layers:
+        return None
+
+    frame = as_dict(layers.get('frame'))
+    ip = as_dict(layers.get('ip'))
+    tcp = as_dict(layers.get('tcp'))
+    mqtt = as_dict(layers.get('mqtt'))
+    tcp_ts = as_dict(tcp.get('Timestamps'))
+
+    raw_frame_delta = frame.get('frame.time_delta')
+    raw_tcp_delta = tcp_ts.get('tcp.time_delta')
+    delta_source = 'frame' if raw_frame_delta is not None else ('tcp' if raw_tcp_delta is not None else 'none')
+
+    src_port = str(_first(tcp.get('tcp.srcport')) or '')
+    dst_port = str(_first(tcp.get('tcp.dstport')) or '')
+    if dst_port == '1883' and src_port != '1883':
+        is_request, is_response = 1, 0
+    elif src_port == '1883' and dst_port != '1883':
+        is_request, is_response = 0, 1
+    else:
+        is_request, is_response = 0, 0
+
+    hdrflags_tree = as_dict(mqtt.get('mqtt.hdrflags_tree'))
+    msg_type = to_int(hdrflags_tree.get('mqtt.msgtype', -1), -1)
+    qos = to_int(hdrflags_tree.get('mqtt.qos', -1), -1)
+    dup_flag = to_int(hdrflags_tree.get('mqtt.dupflag', 0), 0)
+    retain_flag = to_int(hdrflags_tree.get('mqtt.retain', 0), 0)
+
+    topic = _first(mqtt.get('mqtt.topic'))
+    if topic is None:
+        topic_len = -1
+        topic_bucket = -1
+    else:
+        topic_s = str(topic)
+        topic_len = len(topic_s)
+        topic_bucket = int(hashlib.sha1(topic_s.encode('utf-8')).hexdigest(), 16) % 1024
+
+    payload_hex = _first(mqtt.get('mqtt.msg'))
+    if payload_hex:
+        payload_len = len(str(payload_hex).split(':'))
+    else:
+        payload_len = 0
+
+    return {
+        'timestamp': to_epoch_seconds(frame.get('frame.time_epoch'), 0.0),
+        'pkt_len': to_int(frame.get('frame.len', 0), 0),
+        'src_ip': str(_first(ip.get('ip.src')) or '0.0.0.0'),
+        'dst_ip': str(_first(ip.get('ip.dst')) or '0.0.0.0'),
+        'tcp_dst_port': to_int(tcp.get('tcp.dstport', -1), -1),
+        'mb_unit_id': topic_bucket,
+        'mb_func_code': msg_type,
+        'is_request': is_request,
+        'is_response': is_response,
+        'is_exception': 0,
+        'delta_source': delta_source,
+        'mqtt_msg_type': msg_type,
+        'mqtt_qos': qos,
+        'mqtt_dup': 1 if dup_flag > 0 else 0,
+        'mqtt_retain': 1 if retain_flag > 0 else 0,
+        'mqtt_topic_len': topic_len,
+        'mqtt_topic_bucket': topic_bucket,
+        'mqtt_payload_len': payload_len,
+    }
+
+
+@dataclass(frozen=True)
+class FlowKey:
+    src_ip: str
+    dst_ip: str
+    dst_port: int
+
+
+@dataclass
+class WindowAgg:
+    window_sec: int
+    t0: float = 0.0
+    pkt_cnt: int = 0
+    byte_cnt: int = 0
+    req_cnt: int = 0
+    resp_cnt: int = 0
+    exc_cnt: int = 0
+    fc_counter: Counter = field(default_factory=Counter)
+    inter_samples: deque = field(default_factory=lambda: deque(maxlen=INTER_SAMPLE_MAXLEN))
+    neg_delta_cnt: int = 0
+    delta_src_cnt: Counter = field(default_factory=Counter)
+    last_seen_ts: float = 0.0
+    mqtt_type_counter: Counter = field(default_factory=Counter)
+    topic_bucket_counter: Counter = field(default_factory=Counter)
+    topic_len_samples: deque = field(default_factory=lambda: deque(maxlen=INTER_SAMPLE_MAXLEN))
+    payload_len_samples: deque = field(default_factory=lambda: deque(maxlen=INTER_SAMPLE_MAXLEN))
+    pub_cnt: int = 0
+    pub_qos0_cnt: int = 0
+    pub_qos1_cnt: int = 0
+    pub_qos2_cnt: int = 0
+    pub_dup_cnt: int = 0
+    pub_retain_cnt: int = 0
+    pub_payload_nonempty_cnt: int = 0
+
+    def reset(self, new_t0):
+        self.t0 = float(new_t0)
+        self.pkt_cnt = 0
+        self.byte_cnt = 0
+        self.req_cnt = 0
+        self.resp_cnt = 0
+        self.exc_cnt = 0
+        self.fc_counter.clear()
+        self.inter_samples.clear()
+        self.neg_delta_cnt = 0
+        self.delta_src_cnt.clear()
+        self.last_seen_ts = float(new_t0)
+        self.mqtt_type_counter.clear()
+        self.topic_bucket_counter.clear()
+        self.topic_len_samples.clear()
+        self.payload_len_samples.clear()
+        self.pub_cnt = 0
+        self.pub_qos0_cnt = 0
+        self.pub_qos1_cnt = 0
+        self.pub_qos2_cnt = 0
+        self.pub_dup_cnt = 0
+        self.pub_retain_cnt = 0
+        self.pub_payload_nonempty_cnt = 0
+
+    def update(self, pkt, ts):
+        self.pkt_cnt += 1
+        self.last_seen_ts = float(ts)
+        self.byte_cnt += to_int(pkt.get('pkt_len', 0), 0)
+        if pkt.get('is_request'):
+            self.req_cnt += 1
+        if pkt.get('is_response'):
+            self.resp_cnt += 1
+        if pkt.get('is_exception'):
+            self.exc_cnt += 1
+
+        fc = to_int(pkt.get('mb_func_code', -1), -1)
+        if fc >= 0:
+            self.fc_counter[fc] += 1
+
+        inter = to_float(pkt.get('inter_arrival', 0.0), 0.0)
+        if inter > 0:
+            self.inter_samples.append(inter)
+        if pkt.get('is_negative_delta'):
+            self.neg_delta_cnt += 1
+
+        src = pkt.get('delta_source') or 'none'
+        if src not in ('frame', 'tcp', 'none'):
+            src = 'none'
+        self.delta_src_cnt[src] += 1
+
+        msg_type = to_int(pkt.get('mqtt_msg_type', -1), -1)
+        if msg_type >= 0:
+            self.mqtt_type_counter[msg_type] += 1
+
+        topic_bucket = to_int(pkt.get('mqtt_topic_bucket', -1), -1)
+        if topic_bucket >= 0:
+            self.topic_bucket_counter[topic_bucket] += 1
+
+        topic_len = to_int(pkt.get('mqtt_topic_len', -1), -1)
+        if topic_len >= 0:
+            self.topic_len_samples.append(topic_len)
+
+        if msg_type == 3:
+            self.pub_cnt += 1
+            qos = to_int(pkt.get('mqtt_qos', -1), -1)
+            if qos == 0:
+                self.pub_qos0_cnt += 1
+            elif qos == 1:
+                self.pub_qos1_cnt += 1
+            elif qos == 2:
+                self.pub_qos2_cnt += 1
+            if to_int(pkt.get('mqtt_dup', 0), 0) > 0:
+                self.pub_dup_cnt += 1
+            if to_int(pkt.get('mqtt_retain', 0), 0) > 0:
+                self.pub_retain_cnt += 1
+            payload_len = to_int(pkt.get('mqtt_payload_len', 0), 0)
+            self.payload_len_samples.append(payload_len)
+            if payload_len > 0:
+                self.pub_payload_nonempty_cnt += 1
+
+    def finalize_features(self, schema_version, key_kind, key_label):
+        w = float(self.window_sec)
+        pkt_rate = self.pkt_cnt / w
+        byte_rate = self.byte_cnt / w
+
+        req_resp_ratio = self.req_cnt / max(self.resp_cnt, 1)
+        if req_resp_ratio > REQ_RESP_RATIO_CAP:
+            req_resp_ratio = REQ_RESP_RATIO_CAP
+
+        total_fc = sum(self.fc_counter.values())
+        fc_unique_cnt = len(self.fc_counter)
+        fc_entropy = 0.0
+        if total_fc > 0:
+            for cnt in self.fc_counter.values():
+                p = cnt / total_fc
+                fc_entropy -= p * math.log(p + EPS)
+
+        inter = sorted(self.inter_samples)
+
+        def pct(p):
+            if not inter:
+                return 0.0
+            idx = int(p * (len(inter) - 1))
+            return float(inter[idx])
+
+        inter_mean = (sum(inter) / len(inter)) if inter else 0.0
+        inter_std = (
+            math.sqrt(sum((x - inter_mean) ** 2 for x in inter) / len(inter))
+            if inter else 0.0
+        )
+        inter_p50 = pct(0.50)
+        inter_p95 = pct(0.95)
+        burstiness = inter_p95 / max(inter_p50, EPS)
+        exc_ratio = self.exc_cnt / max(self.pkt_cnt, 1)
+
+        mqtt_type_unique_cnt = len(self.mqtt_type_counter)
+        mqtt_type_entropy = 0.0
+        mqtt_type_total = sum(self.mqtt_type_counter.values())
+        if mqtt_type_total > 0:
+            for cnt in self.mqtt_type_counter.values():
+                p = cnt / mqtt_type_total
+                mqtt_type_entropy -= p * math.log(p + EPS)
+
+        topic_unique_cnt = len(self.topic_bucket_counter)
+        topic_entropy = 0.0
+        topic_total = sum(self.topic_bucket_counter.values())
+        if topic_total > 0:
+            for cnt in self.topic_bucket_counter.values():
+                p = cnt / topic_total
+                topic_entropy -= p * math.log(p + EPS)
+
+        topic_lens = sorted(self.topic_len_samples)
+        payload_lens = sorted(self.payload_len_samples)
+
+        def pct_from(values, p):
+            if not values:
+                return 0.0
+            idx = int(p * (len(values) - 1))
+            return float(values[idx])
+
+        topic_len_mean = (sum(topic_lens) / len(topic_lens)) if topic_lens else 0.0
+        topic_len_std = (
+            math.sqrt(sum((x - topic_len_mean) ** 2 for x in topic_lens) / len(topic_lens))
+            if topic_lens else 0.0
+        )
+        pub_payload_len_mean = (sum(payload_lens) / len(payload_lens)) if payload_lens else 0.0
+        pub_payload_len_std = (
+            math.sqrt(sum((x - pub_payload_len_mean) ** 2 for x in payload_lens) / len(payload_lens))
+            if payload_lens else 0.0
+        )
+
+        publish_cnt = self.mqtt_type_counter.get(3, 0)
+        subscribe_cnt = self.mqtt_type_counter.get(8, 0)
+        ping_cnt = self.mqtt_type_counter.get(12, 0) + self.mqtt_type_counter.get(13, 0)
+        ack_cnt = (
+            self.mqtt_type_counter.get(4, 0)
+            + self.mqtt_type_counter.get(5, 0)
+            + self.mqtt_type_counter.get(6, 0)
+            + self.mqtt_type_counter.get(7, 0)
+            + self.mqtt_type_counter.get(9, 0)
+            + self.mqtt_type_counter.get(11, 0)
+        )
+
+        return {
+            'schema_version': schema_version,
+            'protocol': 'mqtt',
+            'feature_family': 'common_v1+mqtt_v1',
+            't0': self.t0,
+            'window_sec': self.window_sec,
+            'key_type': key_kind,
+            'key': key_label,
+            'pkt_cnt': self.pkt_cnt,
+            'byte_cnt': self.byte_cnt,
+            'pkt_rate': pkt_rate,
+            'byte_rate': byte_rate,
+            'req_cnt': self.req_cnt,
+            'resp_cnt': self.resp_cnt,
+            'req_resp_ratio': req_resp_ratio,
+            'exc_cnt': self.exc_cnt,
+            'exc_ratio': exc_ratio,
+            'fc_unique_cnt': fc_unique_cnt,
+            'fc_entropy': fc_entropy,
+            'inter_cnt_pos': len(inter),
+            'inter_mean': inter_mean,
+            'inter_std': inter_std,
+            'inter_p50': inter_p50,
+            'inter_p95': inter_p95,
+            'burstiness': burstiness,
+            'neg_delta_cnt': self.neg_delta_cnt,
+            'delta_src_frame_cnt': self.delta_src_cnt.get('frame', 0),
+            'delta_src_tcp_cnt': self.delta_src_cnt.get('tcp', 0),
+            'delta_src_none_cnt': self.delta_src_cnt.get('none', 0),
+            'mqtt_type_unique_cnt': mqtt_type_unique_cnt,
+            'mqtt_type_entropy': mqtt_type_entropy,
+            'mqtt_type_connect_cnt': self.mqtt_type_counter.get(1, 0),
+            'mqtt_type_connack_cnt': self.mqtt_type_counter.get(2, 0),
+            'mqtt_type_publish_cnt': self.mqtt_type_counter.get(3, 0),
+            'mqtt_type_puback_cnt': self.mqtt_type_counter.get(4, 0),
+            'mqtt_type_pubrec_cnt': self.mqtt_type_counter.get(5, 0),
+            'mqtt_type_pubrel_cnt': self.mqtt_type_counter.get(6, 0),
+            'mqtt_type_pubcomp_cnt': self.mqtt_type_counter.get(7, 0),
+            'mqtt_type_subscribe_cnt': self.mqtt_type_counter.get(8, 0),
+            'mqtt_type_suback_cnt': self.mqtt_type_counter.get(9, 0),
+            'mqtt_type_unsubscribe_cnt': self.mqtt_type_counter.get(10, 0),
+            'mqtt_type_unsuback_cnt': self.mqtt_type_counter.get(11, 0),
+            'mqtt_type_pingreq_cnt': self.mqtt_type_counter.get(12, 0),
+            'mqtt_type_pingresp_cnt': self.mqtt_type_counter.get(13, 0),
+            'mqtt_type_disconnect_cnt': self.mqtt_type_counter.get(14, 0),
+            'pub_cnt': self.pub_cnt,
+            'pub_qos0_ratio': self.pub_qos0_cnt / max(self.pub_cnt, 1),
+            'pub_qos1_ratio': self.pub_qos1_cnt / max(self.pub_cnt, 1),
+            'pub_qos2_ratio': self.pub_qos2_cnt / max(self.pub_cnt, 1),
+            'pub_dup_ratio': self.pub_dup_cnt / max(self.pub_cnt, 1),
+            'pub_retain_ratio': self.pub_retain_cnt / max(self.pub_cnt, 1),
+            'pub_payload_nonempty_ratio': self.pub_payload_nonempty_cnt / max(self.pub_cnt, 1),
+            'pub_payload_len_mean': pub_payload_len_mean,
+            'pub_payload_len_std': pub_payload_len_std,
+            'pub_payload_len_p50': pct_from(payload_lens, 0.50),
+            'pub_payload_len_p95': pct_from(payload_lens, 0.95),
+            'topic_unique_cnt': topic_unique_cnt,
+            'topic_entropy': topic_entropy,
+            'topic_len_mean': topic_len_mean,
+            'topic_len_std': topic_len_std,
+            'topic_len_p50': pct_from(topic_lens, 0.50),
+            'topic_len_p95': pct_from(topic_lens, 0.95),
+            'pub_to_sub_ratio': publish_cnt / max(subscribe_cnt, 1),
+            'ping_ratio': ping_cnt / max(self.pkt_cnt, 1),
+            'ack_ratio': ack_cnt / max(self.pkt_cnt, 1),
+        }
+
+
+def win_start(ts, window_sec):
+    return math.floor(ts / window_sec) * window_sec
+
+
+def flow_key_from_row(row):
+    return FlowKey(
+        src_ip=str(row.get('src_ip') or '0.0.0.0'),
+        dst_ip=str(row.get('dst_ip') or '0.0.0.0'),
+        dst_port=to_int(row.get('tcp_dst_port', -1), -1),
+    )
+
+
+def key_to_obj(key):
+    return {'src_ip': key.src_ip, 'dst_ip': key.dst_ip, 'dst_port': key.dst_port}
+
+
+def open_jsonl_writer(path, append=False):
+    mode = 'a' if append else 'w'
+    out = open(path, mode, encoding='utf-8', buffering=IO_BUFFER_MB * 1024 * 1024)
+    return out
+
+
+def write_jsonl(out, obj):
+    out.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
+
+def flush_and_fsync(handle):
+    handle.flush()
+    try:
+        os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def make_snapshot(input_sig, byte_offset, line_index, total_seen, out_key_written, out_sparse_written, out_global_written, delta_src_total, neg_delta_cnt_total, decode_errors, transform_errors, vlan_skipped):
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'input_path': os.path.abspath(INPUT_FILE),
+        'input_size': input_sig.get('size'),
+        'input_file_signature': input_sig,
+        'byte_offset': int(byte_offset),
+        'line_index': int(line_index),
+        'total_seen': int(total_seen),
+        'output_counts': {
+            'key': int(out_key_written),
+            'sparse': int(out_sparse_written),
+            'global': int(out_global_written),
+            'total': int(out_key_written + out_sparse_written + out_global_written),
+        },
+        'delta_src_cnt': {
+            'frame': int(delta_src_total.get('frame', 0)),
+            'tcp': int(delta_src_total.get('tcp', 0)),
+            'none': int(delta_src_total.get('none', 0)),
+        },
+        'neg_delta_cnt_total': int(neg_delta_cnt_total),
+        'decode_errors': int(decode_errors),
+        'transform_errors': int(transform_errors),
+        'vlan_skipped': int(vlan_skipped),
+        'updated_at': time.time(),
+    }
+
+
+def write_snapshot(path, payload):
+    tmp = f'{path}.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_resume_snapshot(path, input_sig):
+    if not ENABLE_RESUME or not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            snap = json.load(f)
+    except Exception:
+        return None
+
+    if snap.get('schema_version') != SCHEMA_VERSION:
+        raise RuntimeError(
+            f'snapshot schema_version mismatch: snapshot={snap.get("schema_version")} current={SCHEMA_VERSION}'
+        )
+
+    expected_path = os.path.abspath(INPUT_FILE)
+    if snap.get('input_path') != expected_path:
+        raise RuntimeError(f'snapshot input_path mismatch: snapshot={snap.get("input_path")} current={expected_path}')
+
+    if to_int(snap.get('input_size', -1), -1) != to_int(input_sig.get('size', -2), -2):
+        raise RuntimeError('snapshot input_size mismatch')
+
+    if RESUME_STRICT_SIGNATURE and not signatures_match(snap.get('input_file_signature'), input_sig):
+        raise RuntimeError('input file signature changed; refusing resume')
+
+    byte_offset = to_int(snap.get('byte_offset', 0), 0)
+    if byte_offset <= 0:
+        return None
+    return snap
+
+
+def writer_paths():
+    paths = {}
+    for w in WINDOW_SPECS:
+        for suffix in OUTPUT_SUFFIXES:
+            paths[(w, suffix)] = f'{OUTPUT_PREFIX}.win{w}.{suffix}.jsonl'
+    return paths
+
+
+def flush_all_windows(aggs, global_aggs, writers):
+    key_written = 0
+    sparse_written = 0
+    global_written = 0
+    for w in WINDOW_SPECS:
+        key_writer = writers[(w, 'key')]
+        sparse_writer = writers[(w, 'sparse')]
+        global_writer = writers[(w, 'global')]
+
+        for key, agg in aggs[w].items():
+            if agg.pkt_cnt == 0:
+                continue
+            rec = agg.finalize_features(SCHEMA_VERSION, 'flow', key_to_obj(key))
+            if agg.pkt_cnt >= MIN_PKT_CNT:
+                write_jsonl(key_writer, rec)
+                key_written += 1
+            else:
+                write_jsonl(sparse_writer, rec)
+                sparse_written += 1
+
+        gagg = global_aggs[w]
+        if gagg.pkt_cnt > 0:
+            rec = gagg.finalize_features(SCHEMA_VERSION, 'global', '__global__')
+            write_jsonl(global_writer, rec)
+            global_written += 1
+    return key_written, sparse_written, global_written
+
+
+def cleanup_stale_aggs(aggs, ts_now, writers, out_counts):
+    for w in WINDOW_SPECS:
+        t0_now = win_start(ts_now, w)
+        cutoff = ts_now - (w * 2)
+        key_writer = writers[(w, 'key')]
+        sparse_writer = writers[(w, 'sparse')]
+        aggs_w = aggs[w]
+        stale_keys = []
+        for key, agg in aggs_w.items():
+            if agg.pkt_cnt == 0:
+                stale_keys.append(key)
+                continue
+            if agg.t0 < t0_now:
+                rec = agg.finalize_features(SCHEMA_VERSION, 'flow', key_to_obj(key))
+                if agg.pkt_cnt >= MIN_PKT_CNT:
+                    write_jsonl(key_writer, rec)
+                    out_counts['key'] += 1
+                else:
+                    write_jsonl(sparse_writer, rec)
+                    out_counts['sparse'] += 1
+                stale_keys.append(key)
+            elif agg.last_seen_ts < cutoff:
+                stale_keys.append(key)
+        for key in stale_keys:
+            aggs_w.pop(key, None)
+
+
+def main():
+    input_sig = file_signature(INPUT_FILE)
+    output_paths = writer_paths()
+
+    total_seen = 0
+    out_key_written = 0
+    out_sparse_written = 0
+    out_global_written = 0
+    decode_errors = 0
+    transform_errors = 0
+    vlan_skipped = 0
+    delta_src_total = Counter()
+    neg_delta_cnt_total = 0
+    error_samples = deque(maxlen=ERROR_SAMPLE_LIMIT)
+
+    start_offset = 0
+    current_offset = 0
+    start_line_index = 0
+    current_line_index = 0
+    drop_partial_line = False
+    resume_active = False
+    prev_ts_global = None
+    prev_ts_by_key = {}
+
+    resume_snapshot = load_resume_snapshot(SNAPSHOT_FILE, input_sig)
+    if resume_snapshot is not None:
+        start_offset = to_int(resume_snapshot.get('byte_offset', 0), 0)
+        start_line_index = to_int(resume_snapshot.get('line_index', 0), 0)
+        current_offset = start_offset
+        current_line_index = start_line_index
+        resume_active = start_offset > 0
+
+        total_seen = to_int(resume_snapshot.get('total_seen', 0), 0)
+        out_counts = as_dict(resume_snapshot.get('output_counts'))
+        out_key_written = to_int(out_counts.get('key', 0), 0)
+        out_sparse_written = to_int(out_counts.get('sparse', 0), 0)
+        out_global_written = to_int(out_counts.get('global', 0), 0)
+        decode_errors = to_int(resume_snapshot.get('decode_errors', 0), 0)
+        transform_errors = to_int(resume_snapshot.get('transform_errors', 0), 0)
+        vlan_skipped = to_int(resume_snapshot.get('vlan_skipped', 0), 0)
+        delta_src_total = Counter(resume_snapshot.get('delta_src_cnt', {}))
+        neg_delta_cnt_total = to_int(resume_snapshot.get('neg_delta_cnt_total', 0), 0)
+        print(f'resume enabled from offset={start_offset:,} line_index={start_line_index:,}')
+
+    mode, records = iter_records(
+        INPUT_FILE,
+        INPUT_MODE,
+        CHUNK_SIZE_MB,
+        IO_BUFFER_MB,
+        start_offset=start_offset,
+        drop_partial_line=drop_partial_line,
+    )
+    if resume_active and mode != 'jsonl':
+        raise RuntimeError('resume only supports jsonl mode')
+
+    writers = {}
+    for key, path in output_paths.items():
+        writers[key] = open_jsonl_writer(path, append=resume_active)
+
+    aggs = {w: {} for w in WINDOW_SPECS}
+    global_aggs = {w: WindowAgg(window_sec=w) for w in WINDOW_SPECS}
+
+    try:
+        for pkt, decode_error, line_offset, line_no in records:
+            if line_offset is not None:
+                current_offset = line_offset
+            if line_no is not None:
+                current_line_index = start_line_index + line_no
+
+            if decode_error is not None:
+                decode_errors += 1
+                error_samples.append(f'[decode] {decode_error}')
+                continue
+
+            try:
+                row = parse_mqtt_packet(pkt)
+            except Exception as exc:
+                transform_errors += 1
+                error_samples.append(f'[transform] line={current_line_index}: {repr(exc)}')
+                continue
+
+            if row is None:
+                vlan_skipped += 1
+                continue
+
+            total_seen += 1
+            ts = to_float(row.get('timestamp', 0.0), 0.0)
+            if prev_ts_global is None:
+                inter_global = 0.0
+                is_neg_global = False
+            else:
+                raw_inter_global = ts - prev_ts_global
+                is_neg_global = raw_inter_global < 0
+                inter_global = 0.0 if is_neg_global else raw_inter_global
+                if is_neg_global:
+                    neg_delta_cnt_total += 1
+            prev_ts_global = ts
+
+            delta_src_total[row.get('delta_source') or 'none'] += 1
+
+            key = flow_key_from_row(row)
+            prev_key_ts = prev_ts_by_key.get(key)
+            if prev_key_ts is None:
+                inter_key = 0.0
+                is_neg_key = False
+            else:
+                raw_inter_key = ts - prev_key_ts
+                is_neg_key = raw_inter_key < 0
+                inter_key = 0.0 if is_neg_key else raw_inter_key
+            prev_ts_by_key[key] = ts
+
+            row_key = dict(row)
+            row_key['inter_arrival'] = inter_key
+            row_key['is_negative_delta'] = 1 if is_neg_key else 0
+
+            row_global = dict(row)
+            row_global['inter_arrival'] = inter_global
+            row_global['is_negative_delta'] = 1 if is_neg_global else 0
+
+            for w in WINDOW_SPECS:
+                t0_now = win_start(ts, w)
+                aggs_w = aggs[w]
+
+                agg = aggs_w.get(key)
+                if agg is None:
+                    agg = WindowAgg(window_sec=w)
+                    agg.reset(t0_now)
+                    aggs_w[key] = agg
+                elif agg.t0 != t0_now:
+                    if agg.pkt_cnt >= MIN_PKT_CNT:
+                        rec = agg.finalize_features(SCHEMA_VERSION, 'flow', key_to_obj(key))
+                        write_jsonl(writers[(w, 'key')], rec)
+                        out_key_written += 1
+                    else:
+                        rec = agg.finalize_features(SCHEMA_VERSION, 'flow', key_to_obj(key))
+                        write_jsonl(writers[(w, 'sparse')], rec)
+                        out_sparse_written += 1
+                    agg.reset(t0_now)
+                agg.update(row_key, ts)
+
+                gagg = global_aggs[w]
+                if gagg.pkt_cnt == 0:
+                    gagg.reset(t0_now)
+                elif gagg.t0 != t0_now:
+                    grec = gagg.finalize_features(SCHEMA_VERSION, 'global', '__global__')
+                    write_jsonl(writers[(w, 'global')], grec)
+                    out_global_written += 1
+                    gagg.reset(t0_now)
+                gagg.update(row_global, ts)
+
+            if total_seen % AGG_CLEANUP_EVERY == 0:
+                out_counts = {
+                    'key': out_key_written,
+                    'sparse': out_sparse_written,
+                    'global': out_global_written,
+                }
+                cleanup_stale_aggs(aggs, ts, writers, out_counts)
+                out_key_written = out_counts['key']
+                out_sparse_written = out_counts['sparse']
+                out_global_written = out_counts['global']
+
+            if total_seen % FLUSH_EVERY == 0:
+                for out in writers.values():
+                    out.flush()
+
+            if total_seen % SNAPSHOT_EVERY == 0:
+                for out in writers.values():
+                    flush_and_fsync(out)
+                write_snapshot(
+                    SNAPSHOT_FILE,
+                    make_snapshot(
+                        input_sig=input_sig,
+                        byte_offset=current_offset,
+                        line_index=current_line_index,
+                        total_seen=total_seen,
+                        out_key_written=out_key_written,
+                        out_sparse_written=out_sparse_written,
+                        out_global_written=out_global_written,
+                        delta_src_total=delta_src_total,
+                        neg_delta_cnt_total=neg_delta_cnt_total,
+                        decode_errors=decode_errors,
+                        transform_errors=transform_errors,
+                        vlan_skipped=vlan_skipped,
+                    ),
+                )
+
+            if total_seen % PRINT_EVERY == 0:
+                print(
+                    f'processed={total_seen:,} '
+                    f'out_key={out_key_written:,} out_sparse={out_sparse_written:,} out_global={out_global_written:,} '
+                    f'decode_err={decode_errors:,} transform_err={transform_errors:,} vlan_skipped={vlan_skipped:,}'
+                )
+
+        key_n, sparse_n, global_n = flush_all_windows(aggs, global_aggs, writers)
+        out_key_written += key_n
+        out_sparse_written += sparse_n
+        out_global_written += global_n
+
+    finally:
+        for out in writers.values():
+            flush_and_fsync(out)
+            out.close()
+
+    write_snapshot(
+        SNAPSHOT_FILE,
+        make_snapshot(
+            input_sig=input_sig,
+            byte_offset=current_offset,
+            line_index=current_line_index,
+            total_seen=total_seen,
+            out_key_written=out_key_written,
+            out_sparse_written=out_sparse_written,
+            out_global_written=out_global_written,
+            delta_src_total=delta_src_total,
+            neg_delta_cnt_total=neg_delta_cnt_total,
+            decode_errors=decode_errors,
+            transform_errors=transform_errors,
+            vlan_skipped=vlan_skipped,
+        ),
+    )
+
+    print(f'finished input={INPUT_FILE}')
+    print(
+        f'total_seen={total_seen:,} out_key={out_key_written:,} '
+        f'out_sparse={out_sparse_written:,} out_global={out_global_written:,}'
+    )
+    print(f'decode_errors={decode_errors:,} transform_errors={transform_errors:,} vlan_skipped={vlan_skipped:,}')
+    print(f'neg_delta_cnt_total={neg_delta_cnt_total:,} delta_src_cnt={dict(delta_src_total)}')
+    if error_samples:
+        print('recent_errors:')
+        for line in error_samples:
+            print(line)
+
+
+if __name__ == '__main__':
+    main()
